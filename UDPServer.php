@@ -7,46 +7,35 @@
  */
 class UDPServer
 {
-    // Configuration
     private $host;
     private $port;
     private $workers = 1;
     private $socket;
     private $socketClosed = false;
     
-    // Process IDs
     private $masterPid;
     private $workerPids = [];
-    
-    // Status
     private $running = true;
     
-    // Callbacks
     private $onMessageCallback;
     private $onWorkerStartCallback;
     private $onWorkerStopCallback;
     
-    // Timers
     private $timers = [];
     private $nextTimerId = 0;
-    
-    // High performance flags
     private $useReusePort = true;
-    
-    // Long running protection
-    private $loopCount = 0;
-    
+
     public function __construct($host = '0.0.0.0', $port = 3000)
     {
         $this->host = $host;
         $this->port = $port;
     }
-    
+
     public function __destruct()
     {
         $this->closeSocket();
     }
-    
+
     private function closeSocket()
     {
         if (!$this->socketClosed && $this->socket) {
@@ -54,341 +43,242 @@ class UDPServer
             $this->socketClosed = true;
         }
     }
-    
+
     // ==================== CONFIGURATION ====================
-    
+
     public function setWorkers($count)
     {
-        $this->workers = (int)$count;
+        $this->workers = max(1, (int)$count);
         return $this;
     }
-    
+
     public function setReusePort($enabled)
     {
-        $this->useReusePort = $enabled;
+        $this->useReusePort = (bool)$enabled;
         return $this;
     }
-    
-    public function onMessage($callback)
-    {
-        $this->onMessageCallback = $callback;
-        return $this;
-    }
-    
-    public function onWorkerStart($callback)
-    {
-        $this->onWorkerStartCallback = $callback;
-        return $this;
-    }
-    
-    public function onWorkerStop($callback)
-    {
-        $this->onWorkerStopCallback = $callback;
-        return $this;
-    }
-    
-    // ==================== TIMER ====================
-    
+
+    public function onMessage($callback) { $this->onMessageCallback = $callback; return $this; }
+    public function onWorkerStart($callback) { $this->onWorkerStartCallback = $callback; return $this; }
+    public function onWorkerStop($callback) { $this->onWorkerStopCallback = $callback; return $this; }
+
+    // ==================== TIMER ENGINE ====================
+
     public function addTimer($interval, $callback, $repeat = false)
     {
-        $this->nextTimerId++;
-        $id = $this->nextTimerId;
-        
+        $id = ++$this->nextTimerId;
         $this->timers[$id] = [
             'id' => $id,
             'interval' => $interval,
             'callback' => $callback,
             'repeat' => $repeat,
-            'first_run' => microtime(true),
             'next_run' => microtime(true) + $interval,
-            'counter' => 0,
             'active' => true
         ];
-        
         return $id;
     }
-    
-    public function clearTimer($id)
-    {
-        if (isset($this->timers[$id])) {
-            $this->timers[$id]['active'] = false;
-            unset($this->timers[$id]);
-        }
-        return $this;
-    }
-    
+
     private function getNextTimerTimeout()
     {
+        if (empty($this->timers)) return 1.0; // Default sleep 1s if no timers
+        
         $now = microtime(true);
-        $nextTimeout = 1.0;
-        
+        $min = 1.0;
         foreach ($this->timers as $timer) {
-            if (!$timer['active']) continue;
-            $timeout = $timer['next_run'] - $now;
-            if ($timeout < $nextTimeout && $timeout > 0) {
-                $nextTimeout = $timeout;
-            }
+            $diff = $timer['next_run'] - $now;
+            if ($diff < $min) $min = max(0, $diff);
         }
-        
-        return max($nextTimeout, 0.001);
+        return $min;
     }
-    
+
     private function processTimers()
     {
+        if (empty($this->timers)) return;
         $now = microtime(true);
-        
         foreach ($this->timers as $id => &$timer) {
-            if (!$timer['active']) continue;
-            
             if ($now >= $timer['next_run']) {
                 call_user_func($timer['callback'], $id);
-                
                 if ($timer['repeat']) {
-                    $timer['counter']++;
-                    $timer['next_run'] = $timer['first_run'] + ($timer['interval'] * $timer['counter']);
-                    
-                    if ($timer['next_run'] < $now) {
-                        $timer['first_run'] = $now;
-                        $timer['counter'] = 0;
-                        $timer['next_run'] = $now + $timer['interval'];
-                    }
+                    $timer['next_run'] = microtime(true) + $timer['interval'];
                 } else {
                     unset($this->timers[$id]);
                 }
             }
         }
-        
-        // Cleanup old timers every hour
-        static $lastCleanup = 0;
-        if ($now - $lastCleanup > 3600) {
-            foreach ($this->timers as $id => $timer) {
-                if (!$timer['active'] || ($now - $timer['first_run'] > 86400)) {
-                    unset($this->timers[$id]);
-                }
-            }
-            $lastCleanup = $now;
-        }
     }
-    
-    // ==================== SOCKET ====================
-    
+
+    // ==================== NETWORK CORE ====================
+
     private function createSocket()
     {
         $this->socket = socket_create(AF_INET, SOCK_DGRAM, SOL_UDP);
-        
-        if (!$this->socket) {
-            throw new Exception("Cannot create socket: " . socket_strerror(socket_last_error()));
-        }
-        
-        $this->socketClosed = false;
-        
+        if (!$this->socket) throw new Exception("Socket creation failed");
+
         socket_set_option($this->socket, SOL_SOCKET, SO_REUSEADDR, 1);
-        
         if ($this->useReusePort && defined('SO_REUSEPORT')) {
             @socket_set_option($this->socket, SOL_SOCKET, SO_REUSEPORT, 1);
         }
-        
-        @socket_set_option($this->socket, SOL_SOCKET, SO_RCVBUF, 1024 * 1024);
-        @socket_set_option($this->socket, SOL_SOCKET, SO_SNDBUF, 1024 * 1024);
+
+        // Buffer 8MB untuk trafik padat
+        @socket_set_option($this->socket, SOL_SOCKET, SO_RCVBUF, 8 * 1024 * 1024);
+        @socket_set_option($this->socket, SOL_SOCKET, SO_SNDBUF, 8 * 1024 * 1024);
         
         socket_set_nonblock($this->socket);
-        
-        if (!socket_bind($this->socket, $this->host, $this->port)) {
-            throw new Exception("Cannot bind to {$this->host}:{$this->port}: " . socket_strerror(socket_last_error($this->socket)));
+
+        if (!@socket_bind($this->socket, $this->host, $this->port)) {
+            throw new Exception("Bind failed: " . socket_strerror(socket_last_error($this->socket)));
         }
+        $this->socketClosed = false;
     }
-    
+
     public function sendTo($data, $ip, $port)
     {
-        if ($this->socketClosed || !$this->socket) {
-            return false;
-        }
-        
-        return socket_sendto($this->socket, $data, strlen($data), 0, $ip, $port);
+        if ($this->socketClosed || !$this->socket) return false;
+        return @socket_sendto($this->socket, $data, strlen($data), 0, $ip, $port);
     }
-    
-    // ==================== EVENT LOOP ====================
-    
+
     private function runEventLoop()
     {
+        // Optimasi: Alokasi buffer sekali di luar loop
+        $buffer = '';
+        $fromIp = '';
+        $fromPort = 0;
+
         while ($this->running) {
-            if ($this->socketClosed) break;
-            
             $read = [$this->socket];
-            $write = null;
-            $except = null;
+            $write = $except = null;
+            $timeout = $this->getNextTimerTimeout();
             
-            $timeoutUsec = (int)($this->getNextTimerTimeout() * 1000000);
-            $timeoutSec = 0;
-            
-            $num = @socket_select($read, $write, $except, $timeoutSec, $timeoutUsec);
-            
-            if ($num === false) {
-                $error = socket_last_error();
-                if ($error !== 4) {
-                    echo "socket_select error: " . socket_strerror($error) . "\n";
-                }
-                socket_clear_error();
-                pcntl_signal_dispatch();
-                $this->processTimers();
-                continue;
-            }
-            
+            // Konversi ke Sec dan USec
+            $tv_sec = floor($timeout);
+            $tv_usec = ($timeout - $tv_sec) * 1000000;
+
+            // Blocking di level kernel (0% CPU saat idle)
+            $num = @socket_select($read, $write, $except, (int)$tv_sec, (int)$tv_usec);
+
             pcntl_signal_dispatch();
             $this->processTimers();
-            
+
             if ($num > 0) {
-                $buffer = '';
-                $fromIp = '';
-                $fromPort = 0;
-                
-                $bytes = @socket_recvfrom($this->socket, $buffer, 65535, 0, $fromIp, $fromPort);
-                
+                // RADIUS packet jarang > 4096 bytes
+                $bytes = @socket_recvfrom($this->socket, $buffer, 8192, 0, $fromIp, $fromPort);
                 if ($bytes > 0 && $this->onMessageCallback) {
                     call_user_func($this->onMessageCallback, $buffer, $fromIp, $fromPort, $this);
                 }
             }
-            
-            // Prevent CPU overload on idle
-            $this->loopCount++;
-            if ($this->loopCount % 10000 == 0) {
-                usleep(1000);
-            }
         }
     }
-    
-    // ==================== PROCESS MANAGEMENT ====================
-    
+
+    // ==================== PROCESS MGMT ====================
+
     public function start()
     {
         $this->masterPid = posix_getpid();
-        
         $this->printBanner();
         $this->setupSignals();
         $this->createSocket();
-        
+
         for ($i = 0; $i < $this->workers; $i++) {
             $this->forkWorker($i);
         }
-        
+
         $this->monitorWorkers();
     }
-    
+
     private function forkWorker($workerId)
     {
         $pid = pcntl_fork();
-        
-        if ($pid == -1) {
-            throw new Exception("Failed to fork worker {$workerId}");
-        }
-        
+        if ($pid == -1) throw new Exception("Fork failed");
+
         if ($pid == 0) {
+            // Child process
+            $this->workerPids = []; // Worker tidak perlu list saudaranya
             $this->runWorker($workerId);
             exit(0);
+        } else {
+            // Master process
+            $this->workerPids[$workerId] = $pid;
+            echo "[MASTER] Worker #{$workerId} launched (PID: {$pid})\n";
         }
-        
-        $this->workerPids[] = $pid;
-        echo "[MASTER] Worker {$workerId} started (PID: {$pid})\n";
     }
-    
+
     private function runWorker($workerId)
     {
-        $this->running = true;
         $pid = posix_getpid();
-        
-        echo "[WORKER {$workerId}] Started (PID: {$pid})\n";
-        
         if ($this->onWorkerStartCallback) {
             call_user_func($this->onWorkerStartCallback, $workerId, $pid, $this);
         }
-        
+
+        // Override signal handler untuk worker
         pcntl_signal(SIGINT, [$this, 'handleSignal']);
         pcntl_signal(SIGTERM, [$this, 'handleSignal']);
-        
+
         $this->runEventLoop();
-        
+
         if ($this->onWorkerStopCallback) {
             call_user_func($this->onWorkerStopCallback, $workerId, $pid);
         }
-        
         $this->closeSocket();
-        echo "[WORKER {$workerId}] Stopped\n";
     }
-    
+
     private function monitorWorkers()
     {
         while ($this->running) {
             pcntl_signal_dispatch();
             
-            // Reap zombies
+            // Pantau worker yang mati (tanpa blocking)
             while (($pid = pcntl_wait($status, WNOHANG)) > 0) {
-                $key = array_search($pid, $this->workerPids);
-                if ($key !== false) {
-                    echo "[MASTER] Worker PID {$pid} died, restarting...\n";
-                    unset($this->workerPids[$key]);
-                    usleep(500000);
-                    $this->forkWorker($key);
+                $workerId = array_search($pid, $this->workerPids);
+                if ($workerId !== false) {
+                    echo "[MASTER] Worker #{$workerId} (PID {$pid}) exited. Respawning...\n";
+                    unset($this->workerPids[$workerId]);
+                    usleep(100000); // Backoff sedikit agar tidak spamming fork
+                    $this->forkWorker($workerId);
                 }
             }
-            
-            usleep(100000);
+            usleep(200000); // Cek setiap 200ms
         }
-        
         $this->stopAllWorkers();
     }
-    
+
     private function stopAllWorkers()
     {
         echo "\n[MASTER] Stopping all workers...\n";
-        
         foreach ($this->workerPids as $pid) {
             @posix_kill($pid, SIGTERM);
         }
         
+        // Beri waktu 1 detik untuk shutdown bersih
+        usleep(1000000);
+        
         foreach ($this->workerPids as $pid) {
             pcntl_waitpid($pid, $status, WNOHANG);
         }
-        
         $this->closeSocket();
-        echo "[MASTER] All workers stopped\n";
+        echo "[MASTER] Goodbye.\n";
     }
-    
-    // ==================== SIGNAL HANDLER ====================
-    
+
     private function setupSignals()
     {
         pcntl_signal(SIGINT, [$this, 'handleSignal']);
         pcntl_signal(SIGTERM, [$this, 'handleSignal']);
         pcntl_signal(SIGQUIT, [$this, 'handleSignal']);
-        pcntl_signal(SIGCHLD, SIG_IGN);
+        // Biarkan SIGCHLD agar pcntl_wait bekerja
+        pcntl_signal(SIGCHLD, function() {}); 
     }
-    
+
     public function handleSignal($signal)
     {
-        $pid = posix_getpid();
-        
-        if ($pid == $this->masterPid) {
-            echo "\n[MASTER] Shutting down...\n";
-        } else {
-            echo "[WORKER] Shutting down...\n";
-        }
-        
         $this->running = false;
     }
-    
-    // ==================== UI ====================
-    
+
     private function printBanner()
     {
-        echo "\n";
+        echo "\n+--------------------------------------------------+\n";
+        echo "|        OPTIMIZED HIGH PERFORMANCE UDP            |\n";
         echo "+--------------------------------------------------+\n";
-        echo "|         HIGH PERFORMANCE UDP SERVER             |\n";
-        echo "+--------------------------------------------------+\n";
-        echo "|  Host:     {$this->host}:{$this->port}\n";
-        echo "|  Workers:  {$this->workers}\n";
-        echo "|  ReusePort: " . ($this->useReusePort ? 'Yes' : 'No') . "\n";
-        echo "|  Master:   PID {$this->masterPid}\n";
-        echo "+--------------------------------------------------+\n";
-        echo "\n";
+        echo "  Listen: {$this->host}:{$this->port}\n";
+        echo "  Workers: {$this->workers} | SO_REUSEPORT: " . ($this->useReusePort ? 'ON' : 'OFF') . "\n";
+        echo "----------------------------------------------------\n\n";
     }
 }
