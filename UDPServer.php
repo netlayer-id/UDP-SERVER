@@ -26,7 +26,6 @@ class UDPServer
     {
         $this->host = $host;
         $this->port = $port;
-        $this->useReusePort = true;
     }
 
     public function __destruct()
