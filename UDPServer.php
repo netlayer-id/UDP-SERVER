@@ -2,10 +2,10 @@
 /**
  * Author: NETLAYER
  * Website: https://netlayer.id
- * Description: High Performance UDP Server (Lightweight)
- * Function: Multiprocessing, Event Loop, and Timer Management
+ * Description: High Performance UDP Server (Cleaned)
+ * Function: Multiprocessing, Event Loop (Data Transmission Focus)
  */
-class UDPServer
+class RadiusServer
 {
     private $host;
     private $port;
@@ -20,12 +20,9 @@ class UDPServer
     private $onMessageCallback;
     private $onWorkerStartCallback;
     private $onWorkerStopCallback;
-    
-    private $timers = [];
-    private $nextTimerId = 0;
     private $useReusePort = true;
 
-    public function __construct($host = '0.0.0.0', $port = 3000)
+    public function __construct($host = '0.0.0.0', $port = 1812)
     {
         $this->host = $host;
         $this->port = $port;
@@ -58,54 +55,9 @@ class UDPServer
         return $this;
     }
 
-    public function onMessage($callback) { $this->onMessageCallback = $callback; return $this; }
+    public function onPacket($callback) { $this->onMessageCallback = $callback; return $this; }
     public function onWorkerStart($callback) { $this->onWorkerStartCallback = $callback; return $this; }
     public function onWorkerStop($callback) { $this->onWorkerStopCallback = $callback; return $this; }
-
-    // ==================== TIMER ENGINE ====================
-
-    public function addTimer($interval, $callback, $repeat = false)
-    {
-        $id = ++$this->nextTimerId;
-        $this->timers[$id] = [
-            'id' => $id,
-            'interval' => $interval,
-            'callback' => $callback,
-            'repeat' => $repeat,
-            'next_run' => microtime(true) + $interval,
-            'active' => true
-        ];
-        return $id;
-    }
-
-    private function getNextTimerTimeout()
-    {
-        if (empty($this->timers)) return 1.0; // Default sleep 1s if no timers
-        
-        $now = microtime(true);
-        $min = 1.0;
-        foreach ($this->timers as $timer) {
-            $diff = $timer['next_run'] - $now;
-            if ($diff < $min) $min = max(0, $diff);
-        }
-        return $min;
-    }
-
-    private function processTimers()
-    {
-        if (empty($this->timers)) return;
-        $now = microtime(true);
-        foreach ($this->timers as $id => &$timer) {
-            if ($now >= $timer['next_run']) {
-                call_user_func($timer['callback'], $id);
-                if ($timer['repeat']) {
-                    $timer['next_run'] = microtime(true) + $timer['interval'];
-                } else {
-                    unset($this->timers[$id]);
-                }
-            }
-        }
-    }
 
     // ==================== NETWORK CORE ====================
 
@@ -131,7 +83,7 @@ class UDPServer
         $this->socketClosed = false;
     }
 
-    public function sendTo($data, $ip, $port)
+    public function send($data, $ip, $port)
     {
         if ($this->socketClosed || !$this->socket) return false;
         return @socket_sendto($this->socket, $data, strlen($data), 0, $ip, $port);
@@ -139,7 +91,6 @@ class UDPServer
 
     private function runEventLoop()
     {
-        // Optimasi: Alokasi buffer sekali di luar loop
         $buffer = '';
         $fromIp = '';
         $fromPort = 0;
@@ -147,20 +98,14 @@ class UDPServer
         while ($this->running) {
             $read = [$this->socket];
             $write = $except = null;
-            $timeout = $this->getNextTimerTimeout();
             
-            // Konversi ke Sec dan USec
-            $tv_sec = floor($timeout);
-            $tv_usec = ($timeout - $tv_sec) * 1000000;
-
-            // Blocking di level kernel (0% CPU saat idle)
-            $num = @socket_select($read, $write, $except, (int)$tv_sec, (int)$tv_usec);
+            // Menggunakan timeout statis 1 detik untuk efisiensi CPU saat idle
+            $num = @socket_select($read, $write, $except, 1, 0);
 
             pcntl_signal_dispatch();
-            $this->processTimers();
 
             if ($num > 0) {
-                // RADIUS packet jarang > 4096 bytes
+                // RADIUS packet rarely > 4096 bytes
                 $bytes = @socket_recvfrom($this->socket, $buffer, 8192, 0, $fromIp, $fromPort);
                 if ($bytes > 0 && $this->onMessageCallback) {
                     call_user_func($this->onMessageCallback, $buffer, $fromIp, $fromPort, $this);
@@ -191,12 +136,10 @@ class UDPServer
         if ($pid == -1) throw new Exception("Fork failed");
 
         if ($pid == 0) {
-            // Child process
-            $this->workerPids = []; // Worker tidak perlu list saudaranya
+            $this->workerPids = []; 
             $this->runWorker($workerId);
             exit(0);
         } else {
-            // Master process
             $this->workerPids[$workerId] = $pid;
             echo "[MASTER] Worker #{$workerId} launched (PID: {$pid})\n";
         }
@@ -209,7 +152,6 @@ class UDPServer
             call_user_func($this->onWorkerStartCallback, $workerId, $pid, $this);
         }
 
-        // Override signal handler untuk worker
         pcntl_signal(SIGINT, [$this, 'handleSignal']);
         pcntl_signal(SIGTERM, [$this, 'handleSignal']);
 
@@ -226,17 +168,16 @@ class UDPServer
         while ($this->running) {
             pcntl_signal_dispatch();
             
-            // Pantau worker yang mati (tanpa blocking)
             while (($pid = pcntl_wait($status, WNOHANG)) > 0) {
                 $workerId = array_search($pid, $this->workerPids);
                 if ($workerId !== false) {
                     echo "[MASTER] Worker #{$workerId} (PID {$pid}) exited. Respawning...\n";
                     unset($this->workerPids[$workerId]);
-                    usleep(100000); // Backoff sedikit agar tidak spamming fork
+                    usleep(100000); 
                     $this->forkWorker($workerId);
                 }
             }
-            usleep(200000); // Cek setiap 200ms
+            usleep(200000); 
         }
         $this->stopAllWorkers();
     }
@@ -248,7 +189,6 @@ class UDPServer
             @posix_kill($pid, SIGTERM);
         }
         
-        // Beri waktu 1 detik untuk shutdown bersih
         usleep(1000000);
         
         foreach ($this->workerPids as $pid) {
@@ -263,7 +203,6 @@ class UDPServer
         pcntl_signal(SIGINT, [$this, 'handleSignal']);
         pcntl_signal(SIGTERM, [$this, 'handleSignal']);
         pcntl_signal(SIGQUIT, [$this, 'handleSignal']);
-        // Biarkan SIGCHLD agar pcntl_wait bekerja
         pcntl_signal(SIGCHLD, function() {}); 
     }
 
@@ -275,7 +214,7 @@ class UDPServer
     private function printBanner()
     {
         echo "\n+--------------------------------------------------+\n";
-        echo "|        OPTIMIZED HIGH PERFORMANCE UDP            |\n";
+        echo "|        CLEAN HIGH PERFORMANCE UDP SERVER         |\n";
         echo "+--------------------------------------------------+\n";
         echo "  Listen: {$this->host}:{$this->port}\n";
         echo "  Workers: {$this->workers} | SO_REUSEPORT: " . ($this->useReusePort ? 'ON' : 'OFF') . "\n";
