@@ -26,6 +26,7 @@ class UDPServer
     {
         $this->host = $host;
         $this->port = $port;
+        $this->useReusePort = true;
     }
 
     public function __destruct()
@@ -46,12 +47,6 @@ class UDPServer
     public function setWorkers($count)
     {
         $this->workers = max(1, (int)$count);
-        return $this;
-    }
-
-    public function setReusePort($enabled)
-    {
-        $this->useReusePort = (bool)$enabled;
         return $this;
     }
 
@@ -214,7 +209,7 @@ class UDPServer
     private function printBanner()
     {
         echo "\n+--------------------------------------------------+\n";
-        echo "|        CLEAN HIGH PERFORMANCE UDP SERVER         |\n";
+        echo "|        HIGH PERFORMANCE UDP SERVER         |\n";
         echo "+--------------------------------------------------+\n";
         echo "  Listen: {$this->host}:{$this->port}\n";
         echo "  Workers: {$this->workers} | SO_REUSEPORT: " . ($this->useReusePort ? 'ON' : 'OFF') . "\n";
