@@ -5,7 +5,7 @@
  * Description: High Performance UDP Server (Cleaned)
  * Function: Multiprocessing, Event Loop (Data Transmission Focus)
  */
-class RadiusServer
+class UDPServer
 {
     private $host;
     private $port;
